@@ -46,6 +46,9 @@ pub enum Error {
 
     #[error("Parse int error occured: {0}")]
     ParseInt(#[from] std::num::ParseIntError),
+
+    #[error("Read config error occured: {0}")]
+    ConfigError(#[from] config::ConfigError),
 }
 
 pub async fn get_cpus(pool: Arc<SqlitePool>) -> Result<Vec<Cpu>, Error> {

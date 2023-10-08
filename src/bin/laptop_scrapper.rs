@@ -2,7 +2,7 @@ use fantoccini::{error::CmdError, ClientBuilder, Locator};
 use futures::{future::BoxFuture, FutureExt};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sqlx::{migrate::MigrateDatabase, Sqlite, SqlitePool};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -80,6 +80,7 @@ fn get_best_match(devices: &Vec<&str>, cpus: &[Cpu]) -> usize {
 }
 
 fn parse(
+    webdriver: String,
     uri: String,
     parser_type: ParserType,
     pool: Arc<SqlitePool>,
@@ -91,7 +92,7 @@ fn parse(
         // Open new window, and load page
         let c = ClientBuilder::native()
             // .connect("http://127.0.0.1:4444")    // gekodriver
-            .connect("http://127.0.0.1:9515") // chromedriver
+            .connect(&webdriver) // chromedriver
             .await
             .expect("failed to connect to WebDriver");
         c.goto(&uri).await?;
@@ -249,6 +250,7 @@ fn parse(
                     if composition.is_empty() {
                         let pool_clone = pool.clone();
                         set.spawn(parse(
+                            webdriver.clone(),
                             url.clone(),
                             ParserType::RozetkaLaptopDescription(
                                 LaptopWithNoComposition {
@@ -306,6 +308,7 @@ fn parse(
                     if max_page > 1 {
                         for i in 2..=max_page {
                             set.spawn(parse(
+                                webdriver.clone(),
                                 format!("{uri}page={i}/"),
                                 ParserType::RozetkaLaptopList(false, cpus.clone(), gpus.clone()),
                                 pool.clone(),
@@ -374,8 +377,41 @@ fn parse(
     .boxed()
 }
 
+#[derive(Deserialize, Serialize)]
+pub struct WebDriverSettings {
+    pub host: String,
+    pub port: u16,
+}
+
+impl Default for WebDriverSettings {
+    fn default() -> Self {
+        Self{host: String::from("127.0.0.1"), port: 9515}
+    }
+}
+
+impl WebDriverSettings {
+    fn connection_url(self) -> String {
+        format!("http://{}:{}", self.host, self.port)
+    }
+}
+
+pub fn get_configuration() -> Result<WebDriverSettings, config::ConfigError> {
+    config::Config::builder()
+        .add_source(config::Config::try_from(&WebDriverSettings::default()).unwrap())
+        .add_source(config::File::with_name("webdriver.yaml"))
+        .add_source(
+            config::Environment::with_prefix("LAPTOP_SCRAPPER")
+                .try_parsing(true)
+                .separator("_"),
+        )
+        .build()?
+        .try_deserialize()
+}
+
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
+    let webdriver_url = get_configuration()?.connection_url();
     let pool = Arc::new(connect().await);
     let semaphore = Arc::new(Semaphore::new(10));
 
@@ -384,6 +420,7 @@ async fn main() -> Result<(), Error> {
     let mut cpus = Arc::new(get_cpus(pool.clone()).await?);
     if cpus.is_empty() {
         set.spawn(parse(
+            webdriver_url.clone(),
             String::from("https://www.cpubenchmark.net/cpu_list.php"),
             ParserType::CpuBenchmark,
             pool.clone(),
@@ -394,6 +431,7 @@ async fn main() -> Result<(), Error> {
     let mut gpus = Arc::new(get_gpus(pool.clone()).await?);
     if gpus.is_empty() {
         set.spawn(parse(
+            webdriver_url.clone(),
             String::from("https://www.videocardbenchmark.net/gpu_list.php"),
             ParserType::GpuBenchmark,
             pool.clone(),
@@ -411,16 +449,15 @@ async fn main() -> Result<(), Error> {
     if cpus.is_empty() {
         cpus = get_cpus(pool.clone()).await?.into();
     }
-    // println!("{cpus:#?}");
 
     if gpus.is_empty() {
         gpus = get_gpus(pool.clone()).await?.into();
     }
-    // println!("{gpus:#?}");
 
     let laptops = get_laptops(pool.clone()).await?;
     if laptops.is_empty() {
         set.spawn(parse(
+            webdriver_url.clone(),
             String::from("https://rozetka.com.ua/ua/notebooks/c80004/"),
             ParserType::RozetkaLaptopList(true, cpus, gpus),
             pool.clone(),
