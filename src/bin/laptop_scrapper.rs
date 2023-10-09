@@ -1,15 +1,13 @@
-use fantoccini::{error::CmdError, ClientBuilder, Locator};
+use fantoccini::{ClientBuilder, Locator};
 use futures::{future::BoxFuture, FutureExt};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use serde::{Deserialize, Serialize};
-use sqlx::{migrate::MigrateDatabase, Sqlite, SqlitePool};
+use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use laptop_selector::{connect, Error, Cpu, get_cpus, get_gpus};
-
-const DB_URL: &str = "sqlite://laptops.db";
 
 struct LaptopWithNoComposition {
     id: i64,
@@ -236,7 +234,7 @@ fn parse(
                         .text()
                         .await?
                         .chars()
-                        .filter(|char| char.is_ascii_digit())
+                        .filter(char::is_ascii_digit)
                         .collect::<String>()
                         .parse()?;
                     let url = laptop
@@ -463,10 +461,8 @@ async fn main() -> Result<(), Error> {
             pool.clone(),
             semaphore.clone(),
         ));
-        if let Some(result) = set.join_next().await {
-            if result.is_err() {
-                println!("{result:#?}");
-            }
+        if let Err(err) = set.join_next().await.transpose() {
+               println!("{err:#?}");
         };
     }
 
