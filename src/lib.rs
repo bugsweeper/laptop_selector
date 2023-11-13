@@ -214,16 +214,8 @@ pub async fn prepare_laptop_requests_router() -> Router {
     let pool = Arc::new(connect().await);
     let laptops = Arc::new(get_laptops(pool).await.unwrap());
     let max_scores = (
-        laptops
-            .iter()
-            .max_by_key(|laptop| laptop.cpu_score)
-            .unwrap()
-            .cpu_score,
-        laptops
-            .iter()
-            .max_by_key(|laptop| laptop.gpu_score)
-            .unwrap()
-            .gpu_score,
+        laptops.iter().map(|laptop| laptop.cpu_score).max().unwrap(),
+        laptops.iter().map(|laptop| laptop.gpu_score).max().unwrap(),
     );
 
     Router::new()
