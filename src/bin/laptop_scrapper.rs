@@ -26,6 +26,7 @@ enum ParserType {
     RozetkaLaptopDescription(LaptopWithNoComposition, Arc<Vec<Cpu>>, Arc<Vec<Cpu>>),
 }
 
+#[allow(dead_code)]
 struct LaptopView {
     id: i64,
     image: String,
