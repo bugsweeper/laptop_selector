@@ -1,13 +1,15 @@
+use fantoccini::elements::Element;
+use fantoccini::error::CmdError;
 use fantoccini::{ClientBuilder, Locator};
 use futures::{future::BoxFuture, FutureExt};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
+use laptop_selector::{connect, get_cpus, get_gpus, get_laptops, Cpu, Error, LaptopView};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
-use laptop_selector::{connect, Error, Cpu, get_cpus, get_gpus};
 
 struct LaptopWithNoComposition {
     id: i64,
@@ -21,43 +23,9 @@ enum ParserType {
     GpuBenchmark,
     /// bool parameter: add walking on paginator (should be only once, to avoid recursion)
     /// then goes two arrays of Cpu with cpu and gpu collections
-    RozetkaLaptopList(bool, Arc<Vec<Cpu>>, Arc<Vec<Cpu>>),
+    RozetkaLaptopList(bool, Arc<Vec<LaptopView>>, Arc<Vec<Cpu>>, Arc<Vec<Cpu>>),
     /// Partialy gathered info from common list, get composition from products page
     RozetkaLaptopDescription(LaptopWithNoComposition, Arc<Vec<Cpu>>, Arc<Vec<Cpu>>),
-}
-
-struct LaptopView {
-    id: i64,
-    image: String,
-    description: String,
-    composition: String,
-    url: String,
-    price: i64,
-    cpu_id: i64,
-    gpu_id: i64,
-    cpu_score: i64,
-    gpu_score: i64,
-    /// for debug fuzzy comparison  purposes
-    cpu_name: String,
-    gpu_name: String,
-}
-
-async fn get_laptops(pool: Arc<SqlitePool>) -> Result<Vec<LaptopView>, Error> {
-    Ok(sqlx::query_as!(
-        LaptopView,
-        "
-            SELECT laptop.id, laptop.image, laptop.description, 
-                laptop.composition, laptop.url, laptop.price, 
-                laptop.cpu_id, laptop.gpu_id,
-                cpu.score as cpu_score, gpu.score as gpu_score,
-                cpu.name as cpu_name, gpu.name as gpu_name 
-            FROM laptop
-                JOIN cpu ON laptop.cpu_id = cpu.id
-                JOIN gpu on laptop.gpu_id = gpu.id;
-        "
-    )
-    .fetch_all(pool.as_ref())
-    .await?)
 }
 
 fn get_best_match(devices: &Vec<&str>, cpus: &[Cpu]) -> usize {
@@ -75,6 +43,41 @@ fn get_best_match(devices: &Vec<&str>, cpus: &[Cpu]) -> usize {
         }
     }
     cpu_index
+}
+
+async fn try_load_by_element(
+    element: &Element,
+    repeat: bool,
+    css_selector: &str,
+) -> Result<Element, CmdError> {
+    let mut subelement = element.find(Locator::Css(css_selector)).await;
+    if repeat {
+        for _ in 0..3 {
+            if subelement.is_err() {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                subelement = element.find(Locator::Css(css_selector)).await;
+            } else {
+                break;
+            }
+        }
+    }
+    subelement
+}
+
+async fn try_load_by_client(
+    element: &fantoccini::Client,
+    css_selector: &str,
+) -> Result<Element, CmdError> {
+    let mut subelement = element.find(Locator::Css(css_selector)).await;
+    for _ in 0..3 {
+        if subelement.is_err() {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            subelement = element.find(Locator::Css(css_selector)).await;
+        } else {
+            break;
+        }
+    }
+    subelement
 }
 
 fn parse(
@@ -190,19 +193,18 @@ fn parse(
                 }
                 println!("GPU benchmarks dump complete");
             }
-            ParserType::RozetkaLaptopList(spawn_from_paginator, cpus, gpus) => {
+            ParserType::RozetkaLaptopList(spawn_from_paginator, laptops, cpus, gpus) => {
                 // At least check two times, to ensure JS loading is not active anymore
                 let mut laptop_count = 0;
-                let mut laptops = c.find_all(Locator::Css(".catalog-grid__cell")).await?;
-                while laptop_count == 0 || laptop_count != laptops.len() {
-                    laptop_count = laptops.len();
+                let mut laptop_elements = c.find_all(Locator::Css(".catalog-grid__cell")).await?;
+                while laptop_count == 0 || laptop_count != laptop_elements.len() {
+                    laptop_count = laptop_elements.len();
                     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                    laptops = c.find_all(Locator::Css(".catalog-grid__cell")).await?;
+                    laptop_elements = c.find_all(Locator::Css(".catalog-grid__cell")).await?;
                 }
                 let mut set = tokio::task::JoinSet::new();
-                println!("{}", laptops.len());
-
-                for laptop in laptops {
+                let mut first_time = true;
+                for laptop in laptop_elements {
                     let id: i64 = laptop
                         .find(Locator::Css("div.g-id"))
                         .await?
@@ -221,13 +223,15 @@ fn parse(
                         .await?
                         .text()
                         .await?;
-                    let composition = match laptop
-                        .find(Locator::Css(".goods-tile__hidden-content"))
-                        .await
-                    {
-                        Ok(element) => element.text().await?,
-                        Err(_) => String::new(),
-                    };
+                    let composition = if let Ok(element) = try_load_by_element(&laptop, first_time, "p.goods-tile__description_type_text").await {
+                            element.text().await?
+                        } else if let Ok(element) = try_load_by_element(&laptop, first_time, "span.goods-tile__description-control").await {
+                            element.text().await?.replace("•", "/")
+                        } else if let Ok(element) = try_load_by_element(&laptop, first_time, ".goods-tile__hidden-content").await {
+                            element.text().await?
+                        } else {
+                            String::new()
+                        };
                     let price: i64 = laptop
                         .find(Locator::Css(".goods-tile__price-value"))
                         .await?
@@ -245,7 +249,49 @@ fn parse(
                         .unwrap_or_default();
                     // println!("url: {url}");
 
+                    let devices = composition.split('/').map(|device| device.split('(').next().unwrap()).map(|device|device.split('(').next().unwrap()).map(str::trim).collect();
+                    let cpu = &cpus[get_best_match(&devices, &cpus)];
+                    let gpu = &gpus[get_best_match(&devices, &gpus)];
+
+                    first_time = false;
                     if composition.is_empty() {
+                        sqlx::query!(
+                            "INSERT INTO laptop(
+                                id,
+                                image,
+                                description,
+                                url,
+                                price,
+                                cpu_id,
+                                gpu_id
+                            ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                            ON CONFLICT(id) DO
+                            UPDATE SET
+                                image=excluded.image,
+                                description=excluded.description,
+                                url=excluded.url,
+                                price=excluded.price,
+                                cpu_id=excluded.cpu_id,
+                                gpu_id=excluded.gpu_id;
+                            ",
+                            id,
+                            image,
+                            description,
+                            url,
+                            price,
+                            cpu.id,
+                            gpu.id
+                        )
+                        .execute(pool.as_ref())
+                        .await?;
+
+                        if let Some(laptop) = laptops.iter().find(|laptop| laptop.id == id) {
+                            // Do not erase fullfilled information
+                            if laptop.composition.is_some() {
+                                println!("Skip loading composition of {}", laptop.description);
+                                continue;
+                            }
+                        }
                         let pool_clone = pool.clone();
                         set.spawn(parse(
                             webdriver.clone(),
@@ -253,8 +299,8 @@ fn parse(
                             ParserType::RozetkaLaptopDescription(
                                 LaptopWithNoComposition {
                                     id,
-                                    image,
-                                    description,
+                                    image: image.clone(),
+                                    description: description.clone(),
                                     price,
                                 },
                                 cpus.clone(),
@@ -264,12 +310,9 @@ fn parse(
                             semaphore.clone()
                         ));
                     } else {
-                        let devices = composition.split('/').map(|device| device.split('(').next().unwrap()).map(|device|device.split('(').next().unwrap()).map(str::trim).collect();
-                        let cpu = &cpus[get_best_match(&devices, &cpus)];
-                        let gpu = &gpus[get_best_match(&devices, &gpus)];
                         println!("Matched composition:{composition:#?}\nwith cpu: {cpu:#?}\nand gpu: {gpu:#?}");
                         sqlx::query!(
-                            "INSERT INTO laptop(
+                            "INSERT OR REPLACE INTO laptop(
                                 id,
                                 image,
                                 description,
@@ -308,11 +351,10 @@ fn parse(
                             set.spawn(parse(
                                 webdriver.clone(),
                                 format!("{uri}page={i}/"),
-                                ParserType::RozetkaLaptopList(false, cpus.clone(), gpus.clone()),
+                                ParserType::RozetkaLaptopList(false, laptops.clone(), cpus.clone(), gpus.clone()),
                                 pool.clone(),
                                 semaphore.clone(),
                             ));
-                            
                         }
                     }
                 }
@@ -327,18 +369,18 @@ fn parse(
                 }
             }
             ParserType::RozetkaLaptopDescription(laptop, cpus, gpus) => {
-                let composition = c
-                    .find(Locator::Css(".product-about__brief"))
-                    .await?
-                    .text()
-                    .await?;
+                let composition = if let Ok(element) = try_load_by_client(&c, ".product-about__brief").await {
+                    element.text().await?
+                } else {
+                    try_load_by_client(&c, "ul.characteristics-simple__sub-list span.ng-star-inserted").await?.text().await?.replace("•", "/")
+                };
 
                 let devices = composition.split('/').map(|device| device.split('(').next().unwrap()).map(|device|device.split('(').next().unwrap()).map(str::trim).collect();
                 let cpu = &cpus[get_best_match(&devices, &cpus)];
                 let gpu = &gpus[get_best_match(&devices, &gpus)];
 
                 sqlx::query!(
-                    "INSERT INTO laptop(
+                    "INSERT OR REPLACE INTO laptop(
                         id,
                         image,
                         description,
@@ -359,6 +401,7 @@ fn parse(
                 )
                 .execute(pool.as_ref())
                 .await?;
+                println!("Loaded composition of {}", laptop.description);
             }
         }
 
@@ -383,7 +426,10 @@ pub struct WebDriverSettings {
 
 impl Default for WebDriverSettings {
     fn default() -> Self {
-        Self{host: String::from("127.0.0.1"), port: 9515}
+        Self {
+            host: String::from("127.0.0.1"),
+            port: 9515,
+        }
     }
 }
 
@@ -405,7 +451,6 @@ pub fn get_configuration() -> Result<WebDriverSettings, config::ConfigError> {
         .build()?
         .try_deserialize()
 }
-
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -452,19 +497,19 @@ async fn main() -> Result<(), Error> {
         gpus = get_gpus(pool.clone()).await?.into();
     }
 
-    let laptops = get_laptops(pool.clone()).await?;
-    if laptops.is_empty() {
-        set.spawn(parse(
-            webdriver_url.clone(),
-            String::from("https://rozetka.com.ua/ua/notebooks/c80004/"),
-            ParserType::RozetkaLaptopList(true, cpus, gpus),
-            pool.clone(),
-            semaphore.clone(),
-        ));
-        if let Err(err) = set.join_next().await.transpose() {
-               println!("{err:#?}");
-        };
-    }
+    let laptops = Arc::new(get_laptops(pool.clone()).await?);
+
+    set.spawn(parse(
+        webdriver_url.clone(),
+        String::from("https://rozetka.com.ua/ua/notebooks/c80004/"),
+        ParserType::RozetkaLaptopList(true, laptops, cpus, gpus),
+        pool,
+        semaphore.clone(),
+    ));
+
+    if let Err(err) = set.join_next().await.transpose() {
+        println!("{err:#?}");
+    };
 
     Ok(())
 }
