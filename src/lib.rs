@@ -88,7 +88,7 @@ pub struct LaptopView {
     pub id: i64,
     pub image: String,
     pub description: String,
-    pub composition: String,
+    pub composition: Option<String>,
     pub url: String,
     pub price: i64,
     pub cpu_id: i64,
@@ -160,7 +160,7 @@ const PAGE_TEMPLATE: &str = r#"
         </tr>
         {% for laptop in laptops %}
         <tr>
-            <td>{{laptop.total_score}}</td>
+            <td title="{{laptop.laptop.cpu_score}}cpu * {{param.cpu}}% + {{laptop.laptop.gpu_score}}gpu * {{param.gpu}}%">{{laptop.total_score}}</td>
             <td>{{laptop.laptop.price}}</td>
             <td><a href="{{laptop.laptop.url}}">{{laptop.laptop.description}}</a></td>
         </tr>
