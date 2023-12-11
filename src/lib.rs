@@ -51,6 +51,9 @@ pub enum Error {
 
     #[error("Read config error occured: {0}")]
     ConfigError(#[from] config::ConfigError),
+
+    #[error("Parse JSON error occured: {0}")]
+    JsonError(#[from] serde_json::Error),
 }
 
 pub async fn get_cpus(pool: Arc<SqlitePool>) -> Result<Vec<Cpu>, Error> {

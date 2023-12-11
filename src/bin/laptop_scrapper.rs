@@ -6,6 +6,7 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use laptop_selector::{connect, get_cpus, get_gpus, get_laptops, Cpu, Error, LaptopView};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -26,6 +27,7 @@ enum ParserType {
     RozetkaLaptopList(bool, Arc<Vec<LaptopView>>, Arc<Vec<Cpu>>, Arc<Vec<Cpu>>),
     /// Partialy gathered info from common list, get composition from products page
     RozetkaLaptopDescription(LaptopWithNoComposition, Arc<Vec<Cpu>>, Arc<Vec<Cpu>>),
+    RozetkaLaptopListWithApiCalls(Arc<Vec<LaptopView>>, Arc<Vec<Cpu>>, Arc<Vec<Cpu>>),
 }
 
 fn get_best_match(devices: &Vec<&str>, cpus: &[Cpu]) -> usize {
@@ -78,6 +80,135 @@ async fn try_load_by_client(
         }
     }
     subelement
+}
+
+const DATA_FETCHER: &'static str = r#"
+    const [request, callback] = arguments;
+    fetch(`https://xl-catalog-api.rozetka.com.ua/v4/goods/` + request)
+    .then(data => {
+        callback(data.json())
+    })
+"#;
+
+async fn process_page_ajax(
+    number: u64,
+    client: &fantoccini::Client,
+    pool: &Arc<SqlitePool>,
+    cpus: &Arc<Vec<Cpu>>,
+    gpus: &Arc<Vec<Cpu>>,
+) -> u64 {
+    println!("Parsing page {number}");
+    let result = &client
+        .execute_async(
+            DATA_FETCHER,
+            vec![json!(format!(
+                "get?front-type=xl&country=UA&lang=ua&page={number}&category_id=80004"
+            ))],
+        )
+        .await
+        .unwrap()["data"];
+    let total_pages = result["total_pages"].as_u64().unwrap_or(0);
+    let ids = result["ids"].as_array().unwrap();
+    let mut request = ids.into_iter().map(|id| id.as_u64().unwrap().to_string()).fold(String::from("getDetails?country=UA&lang=ua&with_groups=1&with_docket=1&goods_group_href=1&product_ids="), |a, b| a + &b[..] + ",");
+    request.pop();
+    let result = &client
+        .execute_async(DATA_FETCHER, vec![json!(request)])
+        .await
+        .unwrap()["data"];
+    let laptops = result.as_array().unwrap();
+    for laptop in laptops {
+        let laptop = laptop.as_object().unwrap();
+        let id = laptop["id"].as_i64().unwrap();
+        let description = &laptop["title"].as_str().unwrap();
+        let price = laptop["price"].as_i64().unwrap();
+        let url = &laptop["href"].as_str().unwrap();
+        let composition = &laptop["docket"].as_str().unwrap_or_else(|| {
+            if let Some(array) = &laptop["docket"].as_array() {
+                if let Some(object) = array[0].as_object() {
+                    object["value_title"].as_str().unwrap_or("")
+                } else {
+                    println!("Object not found in {laptop:#?}");
+                    ""
+                }
+            } else {
+                println!("Array not found in {laptop:#?}");
+                ""
+            }
+        });
+        let image = &laptop["image_main"].as_str().unwrap_or("");
+
+        let devices = composition
+            .split('/')
+            .map(|device| device.split('(').next().unwrap())
+            .map(|device| device.split('(').next().unwrap())
+            .map(str::trim)
+            .collect();
+        let cpu = &cpus[get_best_match(&devices, &cpus)];
+        let gpu = &gpus[get_best_match(&devices, &gpus)];
+
+        if composition.is_empty() || image.is_empty() {
+            println!("Not full info in {laptop:#?}");
+        }
+
+        if composition.is_empty() {
+            sqlx::query!(
+                "INSERT INTO laptop(
+                        id,
+                        image,
+                        description,
+                        url,
+                        price,
+                        cpu_id,
+                        gpu_id
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    ON CONFLICT(id) DO
+                    UPDATE SET
+                        image=excluded.image,
+                        description=excluded.description,
+                        url=excluded.url,
+                        price=excluded.price,
+                        cpu_id=excluded.cpu_id,
+                        gpu_id=excluded.gpu_id;
+                    ",
+                id,
+                image,
+                description,
+                url,
+                price,
+                cpu.id,
+                gpu.id
+            )
+            .execute(pool.as_ref())
+            .await
+            .unwrap();
+        } else {
+            sqlx::query!(
+                "INSERT OR REPLACE INTO laptop(
+                        id,
+                        image,
+                        description,
+                        composition,
+                        url,
+                        price,
+                        cpu_id,
+                        gpu_id
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                id,
+                image,
+                description,
+                composition,
+                url,
+                price,
+                cpu.id,
+                gpu.id
+            )
+            .execute(pool.as_ref())
+            .await
+            .unwrap();
+        }
+    }
+
+    total_pages
 }
 
 fn parse(
@@ -403,6 +534,12 @@ fn parse(
                 .await?;
                 println!("Loaded composition of {}", laptop.description);
             }
+            ParserType::RozetkaLaptopListWithApiCalls(laptops, cpus, gpus) => {
+                let total_pages = process_page_ajax(1, &c, &pool, &cpus, &gpus).await;
+                for i in 2..=total_pages {
+                    let _ = process_page_ajax(i, &c, &pool, &cpus, &gpus).await;
+                }
+            }
         }
 
         c.close_window().await?;
@@ -502,7 +639,7 @@ async fn main() -> Result<(), Error> {
     set.spawn(parse(
         webdriver_url.clone(),
         String::from("https://rozetka.com.ua/ua/notebooks/c80004/"),
-        ParserType::RozetkaLaptopList(true, laptops, cpus, gpus),
+        ParserType::RozetkaLaptopListWithApiCalls(laptops, cpus, gpus),
         pool,
         semaphore.clone(),
     ));
