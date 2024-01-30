@@ -158,13 +158,17 @@ const PAGE_TEMPLATE: &str = r#"
     <table>
         <tr>
             <th>Score</th>
+            <th>CPU</th>
+            <th>GPU</th>
             <th>Price</th>
             <th>Info</th>
         </tr>
         {% for laptop in laptops %}
         <tr>
             <td title="{{laptop.laptop.cpu_score}}cpu * {{param.cpu}}% + {{laptop.laptop.gpu_score}}gpu * {{param.gpu}}%">{{laptop.total_score}}</td>
-            <td>{{laptop.laptop.price}}</td>
+            <td title="{{laptop.laptop.cpu_name}}">{{laptop.cpu_percent}}%</td>
+            <td title="{{laptop.laptop.gpu_name}}">{{laptop.gpu_percent}}%</td>
+            <td title="Score per price: {{laptop.total_score / laptop.laptop.price}}">{{laptop.laptop.price}}</td>
             <td><a href="{{laptop.laptop.url}}">{{laptop.laptop.description}}</a></td>
         </tr>
         {% endfor %}
@@ -184,6 +188,8 @@ struct LaptopPriorities {
 struct ScoredLaptop<'a> {
     laptop: &'a LaptopView,
     total_score: i64,
+    cpu_percent: i64,
+    gpu_percent: i64,
 }
 
 async fn laptop_request_handler(
@@ -199,6 +205,8 @@ async fn laptop_request_handler(
             laptop,
             total_score: laptop.cpu_score * params.cpu / maximums.0
                 + laptop.gpu_score * params.gpu / maximums.1,
+            cpu_percent: laptop.cpu_score * 100 / maximums.0,
+            gpu_percent: laptop.gpu_score * 100 / maximums.1,
         })
         .collect::<Vec<_>>();
     sorted_laptops.sort_by_key(|laptop| laptop.laptop.price * 1000 / (laptop.total_score + 1));
