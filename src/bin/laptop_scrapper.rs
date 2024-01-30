@@ -1,3 +1,4 @@
+use clap::Parser;
 use fantoccini::elements::Element;
 use fantoccini::error::CmdError;
 use fantoccini::{ClientBuilder, Locator};
@@ -27,7 +28,7 @@ enum ParserType {
     RozetkaLaptopList(bool, Arc<Vec<LaptopView>>, Arc<Vec<Cpu>>, Arc<Vec<Cpu>>),
     /// Partialy gathered info from common list, get composition from products page
     RozetkaLaptopDescription(LaptopWithNoComposition, Arc<Vec<Cpu>>, Arc<Vec<Cpu>>),
-    RozetkaLaptopListWithApiCalls(Arc<Vec<LaptopView>>, Arc<Vec<Cpu>>, Arc<Vec<Cpu>>),
+    RozetkaLaptopListWithApiCalls(Arc<Vec<Cpu>>, Arc<Vec<Cpu>>),
 }
 
 fn get_best_match(devices: &Vec<&str>, cpus: &[Cpu]) -> usize {
@@ -92,6 +93,7 @@ const DATA_FETCHER: &'static str = r#"
 
 async fn process_page_ajax(
     number: u64,
+    filter: &str,
     client: &fantoccini::Client,
     pool: &Arc<SqlitePool>,
     cpus: &Arc<Vec<Cpu>>,
@@ -102,7 +104,8 @@ async fn process_page_ajax(
         .execute_async(
             DATA_FETCHER,
             vec![json!(format!(
-                "get?front-type=xl&country=UA&lang=ua&page={number}&category_id=80004"
+                "get?{}",
+                filter.replace("page_number", &number.to_string())
             ))],
         )
         .await
@@ -110,7 +113,7 @@ async fn process_page_ajax(
     let total_pages = result["total_pages"].as_u64().unwrap_or(0);
     let ids = result["ids"].as_array().unwrap();
     let mut request = ids.into_iter().map(|id| id.as_u64().unwrap().to_string()).fold(String::from("getDetails?country=UA&lang=ua&with_groups=1&with_docket=1&goods_group_href=1&product_ids="), |a, b| a + &b[..] + ",");
-    request.pop();
+    request.pop(); //remove last comma
     let result = &client
         .execute_async(DATA_FETCHER, vec![json!(request)])
         .await
@@ -128,6 +131,13 @@ async fn process_page_ajax(
                     object["value_title"].as_str().unwrap_or("")
                 } else {
                     println!("Object not found in {laptop:#?}");
+                    ""
+                }
+            } else if let Some(title) = &laptop["title"].as_str() {
+                if title.chars().filter(|&c| c == '/').count() >= 3 {
+                    title
+                } else {
+                    println!("Title has no description in {laptop:#?}");
                     ""
                 }
             } else {
@@ -534,10 +544,12 @@ fn parse(
                 .await?;
                 println!("Loaded composition of {}", laptop.description);
             }
-            ParserType::RozetkaLaptopListWithApiCalls(laptops, cpus, gpus) => {
-                let total_pages = process_page_ajax(1, &c, &pool, &cpus, &gpus).await;
+            ParserType::RozetkaLaptopListWithApiCalls(cpus, gpus) => {
+                let filter = pageurl_to_filter(&uri);
+
+                let total_pages = process_page_ajax(1, &filter, &c, &pool, &cpus, &gpus).await;
                 for i in 2..=total_pages {
-                    let _ = process_page_ajax(i, &c, &pool, &cpus, &gpus).await;
+                    let _ = process_page_ajax(i, &filter, &c, &pool, &cpus, &gpus).await;
                 }
             }
         }
@@ -589,8 +601,48 @@ pub fn get_configuration() -> Result<WebDriverSettings, config::ConfigError> {
         .try_deserialize()
 }
 
+const DEFAULT_URL: &str = "https://rozetka.com.ua/ua/notebooks/c80004/";
+
+#[derive(Parser, Default)]
+#[clap(version, about)]
+/// Saves data from benchmark sites and rosetka to database
+struct Arguments {
+    #[clap(short, long)]
+    /// Url with laptop list, can contain filters or sorting  [default: https://rozetka.com.ua/ua/notebooks/c80004/]
+    url: Option<String>,
+}
+
+fn pageurl_to_filter<'a>(url: &'a str) -> String {
+    let mut parameters_iterator = url.split('/').skip(5);
+    let mut parameters: HashMap<&'a str, &'a str> = HashMap::from([
+        ("front-type", "xl"),
+        ("county", "UA"),
+        ("lang", "ua"),
+        ("page", "page_number"),
+    ]);
+    if let Some(category) = parameters_iterator.next() {
+        parameters.insert("category_id", &category[1..]);
+    }
+    if let Some(other_parameters) = parameters_iterator.next() {
+        parameters.extend(other_parameters.split(';').filter_map(|param| {
+            let mut iter = param.split('=');
+            if let (Some(name), Some(value)) = (iter.next(), iter.next()) {
+                Some((name, value))
+            } else {
+                None
+            }
+        }));
+    }
+    let mut parameters_iterator = parameters.iter();
+    let (&name, &value) = parameters_iterator.next().unwrap();
+    parameters_iterator.fold(format!("{name}={value}"), |acc, (&name, &value)| {
+        acc + "&" + name + "=" + value
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
+    let arguments = Arguments::parse();
     let webdriver_url = get_configuration()?.connection_url();
     let pool = Arc::new(connect().await);
     let semaphore = Arc::new(Semaphore::new(10));
@@ -634,12 +686,13 @@ async fn main() -> Result<(), Error> {
         gpus = get_gpus(pool.clone()).await?.into();
     }
 
-    let laptops = Arc::new(get_laptops(pool.clone()).await?);
+    // Using update strategy, that's why don't need to compare with old data, because new data is allways better
+    //let laptops = Arc::new(get_laptops(pool.clone()).await?);
 
     set.spawn(parse(
         webdriver_url.clone(),
-        String::from("https://rozetka.com.ua/ua/notebooks/c80004/"),
-        ParserType::RozetkaLaptopListWithApiCalls(laptops, cpus, gpus),
+        arguments.url.unwrap_or(String::from(DEFAULT_URL)),
+        ParserType::RozetkaLaptopListWithApiCalls(cpus, gpus),
         pool,
         semaphore.clone(),
     ));
